@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 use std::clone::Clone;
 use std::collections::HashMap;
 use std::marker::Sized;
+use std::path::Path;
 
 use std::env;
 use toml::Value;
@@ -204,7 +205,12 @@ pub struct StarshipConfig {
 impl StarshipConfig {
     /// Initialize the Config struct
     pub fn initialize() -> Self {
-        if let Some(file_data) = Self::config_from_file() {
+        if let Some(file_data) = Self::get_env_var().and_then(|s| {
+            // `env::split_paths` does not return a reversible iterator,
+            // so unfortunately it needs to trampoline off of a new Vec.
+            let paths = env::split_paths(&s).collect::<Vec<_>>();
+            Self::config_from_files(paths.iter())
+        }) {
             StarshipConfig {
                 config: Some(file_data),
             }
@@ -215,41 +221,71 @@ impl StarshipConfig {
         }
     }
 
-    /// Create a config from a starship configuration file
-    fn config_from_file() -> Option<Value> {
-        let file_path = if let Ok(path) = env::var("STARSHIP_CONFIG") {
+    /// Create a config from one or more starship configuration files
+    ///
+    /// The first mention of a value wins, which means that the first file
+    /// has precedence over the preceding files.
+    fn config_from_files<P: AsRef<Path>>(
+        paths: impl DoubleEndedIterator<Item = P>,
+    ) -> Option<Value> {
+        paths
+            .rev()
+            .filter_map(|path| match utils::read_file(&path) {
+                Ok(content) => {
+                    log::trace!(
+                        "Config file content for {:?}: \"\n{}\"",
+                        path.as_ref(),
+                        &content
+                    );
+                    Some(content)
+                }
+                Err(e) => {
+                    log::debug!(
+                        "Unable to read config file content for {:?}: {}",
+                        path.as_ref(),
+                        &e
+                    );
+                    None
+                }
+            })
+            .filter_map(|content| match toml::from_str(&content) {
+                Ok(parsed) => {
+                    log::debug!("Config parsed: {:?}", &parsed);
+                    Some(parsed)
+                }
+                Err(error) => {
+                    log::error!("Unable to parse the config file: {}", error);
+                    None
+                }
+            })
+            .fold(None, |acc, val: Value| {
+                if let Some(mut base) = acc {
+                    log::trace!("Merging config {:?} into {:?}", val, base);
+                    merge_toml(&mut base, &val);
+                    Some(base)
+                } else {
+                    Some(val)
+                }
+            })
+            .map(|v| {
+                log::trace!("Fully resolved config: {:?}", &v);
+                v
+            })
+    }
+
+    // Get the contents of the starship config environment variable
+    fn get_env_var() -> Option<String> {
+        if let Ok(path) = env::var("STARSHIP_CONFIG") {
             // Use $STARSHIP_CONFIG as the config path if available
             log::debug!("STARSHIP_CONFIG is set: {}", &path);
-            path
+            Some(path)
         } else {
             // Default to using ~/.config/starship.toml
             log::debug!("STARSHIP_CONFIG is not set");
             let config_path = dirs_next::home_dir()?.join(".config/starship.toml");
             let config_path_str = config_path.to_str()?.to_owned();
             log::debug!("Using default config path: {}", config_path_str);
-            config_path_str
-        };
-
-        let toml_content = match utils::read_file(&file_path) {
-            Ok(content) => {
-                log::trace!("Config file content: \"\n{}\"", &content);
-                Some(content)
-            }
-            Err(e) => {
-                log::debug!("Unable to read config file content: {}", &e);
-                None
-            }
-        }?;
-
-        match toml::from_str(&toml_content) {
-            Ok(parsed) => {
-                log::debug!("Config parsed: {:?}", &parsed);
-                Some(parsed)
-            }
-            Err(error) => {
-                log::error!("Unable to parse the config file: {}", error);
-                None
-            }
+            Some(config_path_str)
         }
     }
 
@@ -451,10 +487,42 @@ fn parse_color_string(color_string: &str) -> Option<ansi_term::Color> {
     predefined_color
 }
 
+/// Merge two TOML config files by mutating the first argument
+fn merge_toml(base: &mut Value, value: &Value) {
+    match value {
+        Value::Table(table) => {
+            if let Value::Table(base_table) = base {
+                for (k, base_v) in base_table.iter_mut() {
+                    if let Some(v) = table.get(k) {
+                        merge_toml(base_v, v);
+                    }
+                }
+                for (k, v) in table.iter() {
+                    match base_table.entry(k) {
+                        toml::map::Entry::Vacant(entry) => {
+                            entry.insert(v.clone());
+                        }
+                        toml::map::Entry::Occupied(_) => {}
+                    }
+                }
+            }
+        }
+        // Arrays are not handled separately from primitives as of now,
+        // which means that all values in an array will be overwritten
+        // as opposed to merged.
+        //
+        // Merging arrays is only relevant when working with arrays of tables,
+        // which does have first-class support in TOML but is rarely used in
+        // starship module configuration.
+        _ => *base = value.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use starship_module_config_derive::ModuleConfig;
+    use std::io::{self, Write};
 
     #[test]
     fn test_load_config() {
@@ -704,5 +772,76 @@ mod tests {
             multi_style,
             Style::new().fg(Color::Fixed(125)).on(Color::Fixed(127))
         );
+    }
+
+    #[test]
+    fn test_load_config_from_single_file() -> io::Result<()> {
+        let config = toml::toml! {
+            symbol = "T "
+            disabled = true
+            some_array = ["A"]
+        };
+        let config_str = toml::to_string(&config).unwrap();
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(config_str.as_bytes())?;
+
+        let actual = StarshipConfig::config_from_files([file.path()].iter());
+
+        assert_eq!(actual, Some(config));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_config_from_multiple_files() -> io::Result<()> {
+        let config1 = toml::toml! {
+            symbol = "T "
+            disabled = true
+            some_array = ["A"]
+            some_map = { value = "yes", style = "red" }
+        };
+        let mut file1 = tempfile::NamedTempFile::new()?;
+        file1.write_all(toml::to_string(&config1).unwrap().as_bytes())?;
+
+        let config2 = toml::toml! {
+            disabled = false
+            some_map = { value = "indeed", addon = "yes" }
+        };
+        let mut file2 = tempfile::NamedTempFile::new()?;
+        file2.write_all(toml::to_string(&config2).unwrap().as_bytes())?;
+
+        let config3 = toml::toml! {
+            disabled = true
+            some_array = ["B"]
+        };
+        let mut file3 = tempfile::NamedTempFile::new()?;
+        file3.write_all(toml::to_string(&config3).unwrap().as_bytes())?;
+
+        let actual = StarshipConfig::config_from_files(
+            [
+                file3.path(),
+                // This path should be ignored while everything else is resolved
+                Path::new(":broken:"),
+                file2.path(),
+                file1.path(),
+            ]
+            .iter(),
+        );
+        let expected = toml::toml! {
+            symbol = "T "
+            disabled = true
+            some_array = ["B"]
+            some_map = { value = "indeed", addon = "yes", style = "red" }
+        };
+
+        assert_eq!(actual, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_config_from_no_files() {
+        let empty: &[&str] = &[];
+        let actual = StarshipConfig::config_from_files(empty.iter());
+
+        assert_eq!(actual, None);
     }
 }
